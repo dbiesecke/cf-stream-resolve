@@ -22,7 +22,7 @@ Deploy after authenticating Wrangler:
 npm run deploy
 ```
 
-The Worker has no required secrets. Its upstream limit is 8 seconds and 1 MB of HTML/JSON per response; redirects are manually followed up to three hops and each target is revalidated. Only HTTP(S), public routable URLs with no credentials are accepted. Private, loopback, link-local, ULA, CGNAT, and cloud-metadata addresses are rejected.
+The Worker has no required secrets or environment variables. Its upstream limit is 8 seconds and 1 MB of HTML/JSON per response; redirects are manually followed up to three hops and each target is revalidated. Only HTTP(S), public routable URLs with no credentials are accepted. Private, loopback, link-local, ULA, CGNAT, and cloud-metadata addresses are rejected. CORS is same-origin only: browser frontends should be served from the Worker origin (or placed behind a same-origin proxy).
 
 ## API
 
@@ -62,6 +62,6 @@ The endpoint returns `{ "url": "…", "label": "…" }` when successful and `{ "
 
 ## Sources and testing
 
-Direct public MP4/HLS URLs and pages containing `<video src>`, `<source src>`, `og:video`, `twitter:player:stream`, `og:image`/`twitter:image`, and favicon fields are supported. ARD, Arte, 3sat, Phoenix and ServusTV pages may resolve only when they expose such public, unprotected metadata; current availability changes. The URLs mentioned in the task may therefore resolve, be unsupported, or be unavailable without attempting any bypass.
+Direct public MP4/HLS URLs and pages containing `<video src>`, `<source src>`, `og:video`, `twitter:player:stream`, conservative public JSON player fields, `og:image`/`twitter:image`, and favicon fields are supported. ARD's public metadata fixture shape is recognised without querying protected APIs. Arte, 3sat, Phoenix and ServusTV pages may resolve only when they expose such public, unprotected metadata; current availability changes. The URLs mentioned in the task may therefore resolve, be unsupported, or be unavailable without attempting any bypass.
 
 Tests use only local fixtures and mocks. Run `npm test`, `npm run lint`, and `npm run typecheck` before deployment.
