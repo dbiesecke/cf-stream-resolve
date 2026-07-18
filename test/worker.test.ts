@@ -91,6 +91,13 @@ describe("MediaFlow gateway", () => {
     expect(() => mediaflowGatewayUrl("/unknown", new URLSearchParams({ d: directHls }), env)).toThrow(/unsupported/i);
   });
 
+  it("rejects direct IP addresses in MediaFlow server configuration", () => {
+    const ipv4Env = { ...env, MEDIAFLOW_PROXY_SERVERS: "https://147.224.146.137", MEDIAFLOW_PROXY_DEFAULT: "https://147.224.146.137" };
+    expect(() => mediaflowGatewayUrl("/proxy/stream", new URLSearchParams({ d: genericVideo }), ipv4Env)).toThrow(/DNS hostname.*direct IP/i);
+    const ipv6Env = { ...env, MEDIAFLOW_PROXY_SERVERS: "https://[2606:4700:4700::1111]", MEDIAFLOW_PROXY_DEFAULT: "https://[2606:4700:4700::1111]" };
+    expect(() => mediaflowGatewayUrl("/proxy/stream", new URLSearchParams({ d: genericVideo }), ipv6Env)).toThrow(/DNS hostname.*direct IP/i);
+  });
+
   it("selects specialized compatibility URLs without exposing configuration", () => {
     expect(new URL(workerProxyUrl("https://worker.example", directHls, env)).pathname).toBe("/proxy/hls/manifest.m3u8");
     expect(new URL(workerProxyUrl("https://worker.example", "https://cdn.example/video.mpd", env)).pathname).toBe("/proxy/mpd/manifest.m3u8");

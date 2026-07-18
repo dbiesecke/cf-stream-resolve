@@ -28,6 +28,8 @@ Configure a comma-separated allowlist and an optional default. The default must 
 }
 ```
 
+Every configured MediaFlow server must use a publicly resolvable DNS hostname. Direct IPv4 and IPv6 origins are rejected during configuration validation because this deployment requires Cloudflare-reachable hostname routing.
+
 Store the password as a Worker secret:
 
 ```sh

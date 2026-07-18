@@ -36,15 +36,29 @@ const hlsSegmentPath = /^\/proxy\/hls\/segment\.(?:ts|m4s|mp4|m4a|m4v|aac)$/;
 const signedMediaflowPath = /^\/_token_[A-Za-z0-9_-]{32,4096}\/(?:proxy|extractor)\/[A-Za-z0-9._/-]{1,256}$/;
 const requestHeaders = new Set(["accept", "content-type", "if-range", "range"]);
 
+function isIpHostname(hostname: string): boolean {
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname) || (hostname.startsWith("[") && hostname.endsWith("]"));
+}
+
+function validateConfiguredServer(value: string): URL {
+  let server: URL;
+  try { server = validatePublicUrl(value); }
+  catch { throw new MediaflowError("configuration", "A configured MediaFlow proxy server is invalid."); }
+  if (isIpHostname(server.hostname)) throw new MediaflowError("configuration", "MediaFlow proxy servers must use a DNS hostname; direct IP origins are not supported by this deployment.");
+  return server;
+}
+
 function configuredServers(env: MediaflowConfig): string[] {
-  return [...new Set((env.MEDIAFLOW_PROXY_SERVERS ?? "").split(",").map((value) => value.trim().replace(/\/+$/, "")).filter(Boolean))];
+  const servers = [...new Set((env.MEDIAFLOW_PROXY_SERVERS ?? "").split(",").map((value) => value.trim().replace(/\/+$/, "")).filter(Boolean))];
+  for (const server of servers) validateConfiguredServer(server);
+  return servers;
 }
 
 function selectedServer(env: MediaflowConfig): URL {
   const servers = configuredServers(env);
   const candidate = (env.MEDIAFLOW_PROXY_DEFAULT || servers[0] || "").trim().replace(/\/+$/, "");
   if (!candidate || !servers.includes(candidate)) throw new MediaflowError("configuration", "No allowed MediaFlow proxy server is configured.");
-  try { return validatePublicUrl(candidate); } catch { throw new MediaflowError("configuration", "A configured MediaFlow proxy server is invalid."); }
+  return validateConfiguredServer(candidate);
 }
 
 export function assertMediaflowConfigured(env: MediaflowConfig): void {
