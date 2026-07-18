@@ -1,4 +1,6 @@
-import { validatePublicUrl } from "./validation";
+import { validatePublicUrl, validateResolvedAddresses } from "./validation";
+import type { DnsLookup } from "./validation";
+import { defaultDnsLookup } from "./network";
 
 export interface MediaflowConfig {
   MEDIAFLOW_PROXY_SERVERS?: string;
@@ -27,6 +29,8 @@ const gatewayPaths = new Set([
   "/proxy/mpd/playlist.m3u8",
   "/proxy/mpd/segment.mp4",
   "/extractor/video",
+  "/extractor/video.m3u8",
+  "/extractor/video.mp4",
 ]);
 const hlsSegmentPath = /^\/proxy\/hls\/segment\.(?:ts|m4s|mp4|m4a|m4v|aac)$/;
 const requestHeaders = new Set(["accept", "content-type", "if-range", "range"]);
@@ -63,7 +67,7 @@ function allowedParameter(pathname: string, name: string): boolean {
   if (pathname === "/proxy/mpd/manifest.m3u8") return lower === "key_id" || lower === "key";
   if (pathname === "/proxy/mpd/playlist.m3u8") return lower === "profile_id" || lower === "key_id" || lower === "key";
   if (pathname === "/proxy/mpd/segment.mp4") return ["init_url", "segment_url", "mime_type", "key_id", "key"].includes(lower);
-  if (pathname === "/extractor/video") return ["host", "redirect_stream", "extra_params"].includes(lower);
+  if (pathname.startsWith("/extractor/video")) return ["host", "redirect_stream", "extra_params"].includes(lower);
   return false;
 }
 
@@ -121,8 +125,13 @@ async function isCloudflare1003(response: Response): Promise<boolean> {
   return (await response.clone().text()).trim().toLowerCase() === "error code: 1003";
 }
 
-export async function fetchMediaflowGateway(request: Request, env: MediaflowConfig, fetcher: typeof fetch = fetch): Promise<{ response: Response; target: URL }> {
+export async function fetchMediaflowGateway(request: Request, env: MediaflowConfig, fetcher: typeof fetch = fetch, lookup: DnsLookup = defaultDnsLookup): Promise<{ response: Response; target: URL }> {
   const incoming = new URL(request.url);
+  const destination = incoming.searchParams.get("d");
+  if (destination) {
+    try { await validateResolvedAddresses(validatePublicUrl(destination), lookup); }
+    catch (error) { throw new MediaflowError("invalid", error instanceof Error ? error.message.replace(/^DNS_BLOCKED:\s*/, "") : "The destination failed DNS validation."); }
+  }
   const target = mediaflowGatewayUrl(incoming.pathname, incoming.searchParams, env);
   const response = await fetchWithHeaderTimeout(target, { method: request.method, headers: upstreamHeaders(request), redirect: "manual" }, fetcher);
   if (await isCloudflare1003(response)) {
@@ -130,7 +139,6 @@ export async function fetchMediaflowGateway(request: Request, env: MediaflowConf
     noProxyTarget.searchParams.set("no_proxy", "true");
     const noProxyResponse = await fetchWithHeaderTimeout(noProxyTarget, { method: request.method, headers: upstreamHeaders(request), redirect: "manual" }, fetcher);
     if (!await isCloudflare1003(noProxyResponse)) return { response: noProxyResponse, target };
-    const destination = incoming.searchParams.get("d");
     if (!destination) return { response: noProxyResponse, target };
     const directTarget = new URL(validateGatewayDestination(destination));
     const direct = await fetchWithHeaderTimeout(directTarget, { method: request.method, headers: directFallbackHeaders(request, incoming.searchParams), redirect: "manual" }, fetcher);

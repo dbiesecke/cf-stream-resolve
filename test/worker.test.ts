@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { handle } from "../src/worker";
+import { handle as workerHandle } from "../src/worker";
 import {
   fetchMediaflowGateway,
   mediaflowGatewayUrl,
@@ -13,6 +13,8 @@ const env = {
   MEDIAFLOW_PROXY_DEFAULT: "https://mediaflow-a.example",
   MEDIAFLOW_API_PASSWORD: "test-secret",
 };
+const publicDns = async () => ["93.184.216.34"];
+const handle: typeof workerHandle = (incoming, testEnv, fetcher = fetch) => workerHandle(incoming, testEnv, fetcher, publicDns);
 const directHls = "https://stream.4fun.tv:8888/hls/4f_high/index.m3u8";
 const genericVideo = "https://video.example/embed/fixture";
 const request = (path: string, init?: RequestInit) => new Request(`https://worker.example${path}`, init);
@@ -23,8 +25,8 @@ const mcp = (body: unknown, init: RequestInit = {}) => {
 };
 
 describe("resolve_video routing", () => {
-  it("routes the reported Vidmoly result through the HLS endpoint", () => {
-    const result = resolveVideo("https://worker.example", {
+  it("routes the reported Vidmoly result through the HLS endpoint", async () => {
+    const result = await resolveVideo("https://worker.example", {
       url: directHls,
       link: "https://vidmoly.biz/embed-ynhyvaz86ylw.html",
       endpoint: "/proxy/stream",
@@ -46,27 +48,27 @@ describe("resolve_video routing", () => {
     expect(result.data.url).not.toContain("mediaflow-a.example");
   });
 
-  it("keeps YouTube direct without requiring MediaFlow configuration", () => {
-    const result = resolveVideo("https://worker.example", { url: "https://youtu.be/fixture" }, {});
+  it("keeps YouTube direct without requiring MediaFlow configuration", async () => {
+    const result = await resolveVideo("https://worker.example", { url: "https://youtu.be/fixture" }, {});
     expect(result).toMatchObject({ outcome: "ok", data: { url: "https://youtu.be/fixture", mediaType: "youtube" } });
   });
 
-  it("routes DASH, generic streams, and supported extractors deterministically", () => {
-    expect(resolveVideo("https://worker.example", { url: "https://cdn.example/video.mpd" }, env)).toMatchObject({ outcome: "ok", data: { mediaType: "dash" } });
-    expect(resolveVideo("https://worker.example", { url: genericVideo }, env)).toMatchObject({ outcome: "ok", data: { mediaType: "stream" } });
-    const extractor = resolveVideo("https://worker.example", { url: "https://doodstream.com/e/fixture", provider: "DOODSTREAM", redirect_stream: true }, env);
+  it("routes DASH, direct streams, and supported extractors deterministically", async () => {
+    expect(await resolveVideo("https://worker.example", { url: "https://cdn.example/video.mpd" }, env)).toMatchObject({ outcome: "ok", data: { mediaType: "dash" } });
+    expect(await resolveVideo("https://worker.example", { url: "https://video.example/file.mp4" }, env)).toMatchObject({ outcome: "ok", data: { mediaType: "stream" } });
+    const extractor = await resolveVideo("https://worker.example", { url: "https://doodstream.com/e/fixture", provider: "DOODSTREAM", redirect_stream: true }, env);
     expect(extractor).toMatchObject({ outcome: "ok", data: { mediaType: "extractor" } });
     if (extractor.outcome === "ok") {
       const url = new URL(extractor.data.url);
-      expect(url.pathname).toBe("/extractor/video");
+      expect(url.pathname).toBe("/extractor/video.mp4");
       expect(url.searchParams.get("host")).toBe("Doodstream");
       expect(url.searchParams.get("redirect_stream")).toBe("true");
     }
   });
 
-  it("rejects a Vidmoly embed but accepts a separate direct URL with Vidmoly context", () => {
-    expect(resolveVideo("https://worker.example", { url: "https://vidmoly.biz/embed-fixture.html", provider: "Vidmoly" }, env).outcome).toBe("unsupported_provider");
-    expect(resolveVideo("https://worker.example", { url: "https://cdn.example/token", link: "https://vidmoly.biz/embed-fixture.html", provider: "Vidmoly" }, env)).toMatchObject({ outcome: "ok", data: { mediaType: "stream" } });
+  it("supports Vidmoly embeds and separate direct URLs with Vidmoly context", async () => {
+    expect(await resolveVideo("https://worker.example", { url: "https://vidmoly.biz/embed-fixture.html", provider: "Vidmoly" }, env)).toMatchObject({ outcome: "ok", data: { mediaType: "extractor" } });
+    expect(await resolveVideo("https://worker.example", { url: "https://cdn.example/token", link: "https://vidmoly.biz/embed-fixture.html", provider: "Vidmoly" }, env)).toMatchObject({ outcome: "ok", data: { mediaType: "stream" } });
   });
 });
 
@@ -94,7 +96,7 @@ describe("MediaFlow gateway", () => {
     const result = await fetchMediaflowGateway(incoming, env, async (input, init) => {
       seenRequest = new Request(input, init);
       return new Response(null, { status: 206, headers: { "content-range": "bytes 0-99/1000" } });
-    });
+    }, publicDns);
     expect(seenRequest?.method).toBe("HEAD");
     expect(seenRequest?.headers.get("range")).toBe("bytes=0-99");
     expect(seenRequest?.headers.get("if-range")).toBe("etag");
@@ -230,7 +232,7 @@ describe("MCP Streamable HTTP and compatibility routes", () => {
   });
 
   it("returns a structured MCP error for unsupported provider extraction", async () => {
-    const called = await mcp({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "resolve_video", arguments: { url: "https://vidmoly.biz/embed-fixture.html", provider: "Vidmoly" } } });
+    const called = await mcp({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "resolve_video", arguments: { url: "https://unknown.example/embed-fixture.html", provider: "Unsupported" } } });
     const body = await called.json() as { result: { isError: boolean; content: Array<{ text: string }> } };
     expect(body.result.isError).toBe(true);
     expect(JSON.parse(body.result.content[0].text)).toMatchObject({ outcome: "unsupported_provider" });
@@ -242,7 +244,7 @@ describe("MCP Streamable HTTP and compatibility routes", () => {
     expect(new URL(body.response.data.url).pathname).toBe("/proxy/hls/manifest.m3u8");
     expect(body.response.data.mediaType).toBe("hls");
     expect(body.response.data.warnings).toHaveLength(1);
-    const msx = await handle(request(`/interaction/resolve.html?url=${encodeURIComponent(genericVideo)}`), env);
+    const msx = await handle(request(`/interaction/resolve.html?url=${encodeURIComponent("https://video.example/file.mp4")}`), env);
     expect(await msx.json()).toMatchObject({ mediaType: "stream" });
   });
 });

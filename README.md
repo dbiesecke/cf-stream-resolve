@@ -1,13 +1,25 @@
 # cf-stream-resolve
 
-A Cloudflare Worker that classifies public video URLs and creates the correct, Worker-local MediaFlow playback URL. Local host adapters, HTML scraping, browser impersonation, and access-control bypasses are intentionally not included.
+A Cloudflare Worker that classifies public video, manifest, embed, redirect, and ARD Mediathek URLs and creates Worker-local MediaFlow playback URLs. It keeps MediaFlow servers and credentials private and exposes a stateless MCP tool plus a diagnostic REST API.
+
+## Resolution pipeline
+
+Every request uses one pipeline:
+
+1. Validate and normalize the public HTTP(S) URL.
+2. Detect direct files, HLS, DASH, AniWorld, ARD, or a registered extractor provider.
+3. Resolve bounded HTTP/HTML redirects or a concrete ARD item when required.
+4. Classify the resolved URL again.
+5. Build one Worker-local MediaFlow URL with `URLSearchParams`.
+6. Optionally probe playback with HEAD and a bounded Range GET.
+
+Unknown web pages are never sent blindly to `/proxy/stream`. HTML inspection recognizes only URLs, meta refreshes, simple location assignments, and `location.replace()`. It does not execute JavaScript or emulate a browser.
 
 ## Configuration
 
-Configure a comma-separated allowlist and its default in the Worker environment. Values must be public HTTP(S) MediaFlow base URLs and the default must be an exact member of the list.
+Configure a comma-separated allowlist and an optional default. The default must exactly match an allowlisted server.
 
 ```jsonc
-// wrangler.jsonc (example values only)
 {
   "vars": {
     "MEDIAFLOW_PROXY_SERVERS": "https://mediaflow-1.example,https://mediaflow-2.example",
@@ -16,68 +28,91 @@ Configure a comma-separated allowlist and its default in the Worker environment.
 }
 ```
 
-Set the password outside the repository:
+Store the password as a Worker secret:
 
 ```sh
 npx wrangler secret put MEDIAFLOW_API_PASSWORD
 ```
 
-`MEDIAFLOW_API_PASSWORD` is appended only to the selected MediaFlow upstream request and is removed from Worker-generated URLs, relayed redirects, and rewritten manifests.
+Clients cannot select a MediaFlow server. `MEDIAFLOW_API_PASSWORD` is added only to upstream requests and is removed from public URLs, rewritten manifests, and relayed redirects.
 
-## API
+## Provider registry
 
-The resolver chooses a playback route from the URL before any media is fetched:
+The central registry contains provider IDs, canonical MediaFlow names, strict host and alias rules, path hints, preferred player endpoints, and `redirect_stream` support.
 
-- YouTube URLs remain direct.
-- `.m3u8` and `.m3u` use `/proxy/hls/manifest.m3u8`.
-- `.mpd` uses `/proxy/mpd/manifest.m3u8`.
-- Supported extractor providers use `/extractor/video`.
-- Other public HTTP(S) URLs use `/proxy/stream`.
+| Provider IDs | Canonical MediaFlow names |
+| --- | --- |
+| `city`, `lulustream`, `turbovidplay`, `doodstream`, `maxstream`, `uqload` | `City`, `LuluStream`, `TurboVidPlay`, `Doodstream`, `Maxstream`, `Uqload` |
+| `f16px`, `mixdrop`, `vavoo`, `fastream`, `okru`, `vidfast` | `F16Px`, `Mixdrop`, `Vavoo`, `Fastream`, `Okru`, `VidFast` |
+| `filelions`, `sportsonline`, `vidmoly`, `filemoon`, `streamtape`, `vidoza` | `FileLions`, `Sportsonline`, `Vidmoly`, `FileMoon`, `Streamtape`, `Vidoza` |
+| `gupload`, `streamwish`, `vixcloud`, `livetv`, `supervideo`, `voe` | `Gupload`, `StreamWish`, `VixCloud`, `LiveTV`, `Supervideo`, `Voe` |
 
-Gateway routes validate `d`, select the configured MediaFlow server, and support cross-origin `GET`, `HEAD`, and byte-range requests. Binary streams pass through without buffering. HLS manifests are size-bounded and rewritten so nested playlists, segments, keys, and init maps stay on the Worker origin.
+Confirmed aliases include VOE's `ellenpoliticalfollow.com`, Vidoza's `videzz.net`, Uqload mirrors, TurboVidPlay mirrors, and Sportsonline/Sportzonline variants. Host matches require a real domain boundary; names such as `voe.sx.example.org` are not accepted as VOE.
 
-If MediaFlow returns the exact Cloudflare response `403 error code: 1003` for an otherwise valid public destination, the Worker first retries MediaFlow with its documented `no_proxy=true` mode and then retries the validated destination directly. This fallback chain is deliberately limited to that signature; all other MediaFlow errors pass through unchanged.
+### Endpoint selection
 
-```sh
-curl -i 'https://YOUR-WORKER.workers.dev/proxy/hls/manifest.m3u8?d=https%3A%2F%2Fcdn.example%2Flive%2Findex.m3u8'
-```
+- `.m3u8`, `.m3u`, `.m3u_plus` → `/proxy/hls/manifest.m3u8`
+- `.mpd` → `/proxy/mpd/manifest.m3u8`
+- `.mp4`, `.mkv`, `.webm`, `.ts`, `.mov`, `.m4v` → `/proxy/stream`
+- HLS extractors → `/extractor/video.m3u8`
+- MP4 extractors → `/extractor/video.mp4`
+- Dynamic Vavoo and LiveTV extraction → `/extractor/video`
 
-The server is selected exclusively from `MEDIAFLOW_PROXY_SERVERS`; clients cannot choose or override a proxy host. `MEDIAFLOW_PROXY_DEFAULT` selects an allowlisted entry, and the first configured server is used if no default is set.
+`redirect_stream=true` is emitted only for registered extractor endpoints. It is never attached to proxy endpoints. A provider extension is a player hint; MediaFlow still performs the actual extraction and proxy selection.
 
-`/` and `/interaction/resolve.html` remain available and preserve their existing JSON and MSX response envelopes. Their `url` input is classified using the same resolver as MCP. Compatibility options `redirect_stream`, `transcode`, and `max_res` remain accepted; options unsupported by the configured MediaFlow API are omitted and reported in `warnings`.
+## Diagnostic API
 
-## MCP
-
-`POST /mcp` is a stateless Streamable HTTP MCP Tool Server. It supports protocol versions `2025-11-25` and `2025-03-26`, JSON-RPC batches, `initialize`, `notifications/initialized`, `ping`, `tools/list`, and `tools/call`. The endpoint exposes one deterministic, read-only and idempotent tool: `resolve_video`.
-
-Clients should send `Content-Type: application/json` and an `Accept` header that includes both `application/json` and `text/event-stream`. This server does not offer an SSE stream or session management, so `GET /mcp` and `DELETE /mcp` return `405 Method Not Allowed`. Browser requests must use the Worker origin; non-browser clients may omit `Origin`.
-
-Initialize the connection:
+### Diagnose a URL
 
 ```sh
-curl -X POST https://YOUR-WORKER.workers.dev/mcp \
+curl -X POST https://resolve.nated.at/resolve/diagnose \
   -H 'content-type: application/json' \
-  -H 'accept: application/json, text/event-stream' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0.0"}}}'
+  --data '{
+    "url": "https://voe.sx/e/example",
+    "redirectStream": true,
+    "checkPlayback": true
+  }'
 ```
 
-Discover and call the tool:
+`checkPlayback` defaults to `false`. When enabled, the Worker first sends HEAD and falls back to a bounded Range GET when HEAD is rejected or uninformative. Results distinguish `classified`, `playback_url_created`, `endpoint_reachable`, `manifest_loaded`, and `playable`.
+
+The response includes classification confidence, matched rule, redirect chain, resolved source, MediaFlow endpoint, playback URL, HTTP metadata, duration, CORS indication, warnings, and a stable sanitized error.
+
+### List providers
 
 ```sh
-curl -X POST https://YOUR-WORKER.workers.dev/mcp \
-  -H 'content-type: application/json' \
-  -H 'accept: application/json, text/event-stream' \
-  --data '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-
-curl -X POST https://YOUR-WORKER.workers.dev/mcp \
-  -H 'content-type: application/json' \
-  -H 'accept: application/json, text/event-stream' \
-  --data '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"resolve_video","arguments":{"url":"https://cdn.example/live/index.m3u8","link":"https://video.example/embed/abc","provider":"Vidmoly"}}}'
+curl https://resolve.nated.at/resolve/providers
 ```
 
-The tool only creates a direct YouTube URL or Worker-local playback URL. It does not fetch media during the call, bypass access controls, or expose MediaFlow credentials. Successful results retain `url`, `source`, `original`, and `alternates`, and may add `mediaType` and `warnings`.
+The response exposes only provider IDs, canonical MediaFlow names, preferred endpoints, and redirect support. The complete OpenAPI 3.1.1 contract and examples are in [`openapi.yaml`](openapi.yaml).
 
-For compatibility with clients that attach playback context, `resolve_video` accepts optional `link`, `endpoint` (only `/proxy/stream`), and `provider` fields. `endpoint` never overrides automatic routing. A validated `link` supplies upstream Referer and Origin context but never replaces `url`. Direct media URLs take precedence over provider extraction. The configured MediaFlow API currently supports `Doodstream`, `Mixdrop`, `Uqload`, `Streamtape`, `Supervideo`, and `LiveTV`; other embed-only providers return `unsupported_provider`.
+## Redirects, AniWorld, and ARD
+
+Redirect resolution uses manual redirects, a five-hop limit, per-request and total timeouts, and validation before each fetch. AniWorld is a redirect source, never a MediaFlow provider; its final target determines the extractor.
+
+ARD series and season pages return `ARD_NOT_PLAYABLE_ITEM`. The resolver never selects an arbitrary episode. Concrete items are inspected for structured player data and HLS, DASH, or direct media URLs before normal endpoint selection.
+
+If an unknown page exposes more than one supported target, the result is `partially_resolved` and no arbitrary target is selected.
+
+## Security
+
+- Only public HTTP(S) URLs without credentials are accepted.
+- Loopback, private, link-local, carrier-grade NAT, benchmarking, multicast, and reserved IPv4/IPv6 ranges are blocked.
+- A and AAAA answers are checked through DNS-over-HTTPS before every server-side page fetch.
+- Every redirect target is validated again.
+- HTML is limited to 512 KiB, playback samples to 64 KiB, individual fetches to 8 seconds, and resolution to 20 seconds.
+- Large media responses continue to stream; only bounded HTML, manifests, and diagnostic samples are buffered.
+- No stack traces, tokens, API keys, cookies, or sensitive request headers are returned.
+
+DNS validation reduces rebinding risk, but Cloudflare Workers cannot pin the checked address to the later hostname fetch. Deployments that require cryptographic network isolation should add an egress proxy that performs DNS resolution and the connection atomically.
+
+## MCP and compatibility routes
+
+`POST /mcp` remains a stateless Streamable HTTP MCP server with `resolve_video`. Protocols `2025-11-25` and `2025-03-26`, batches, initialization, ping, tool listing, origin validation, and JSON content negotiation remain supported.
+
+Compatibility fields `link`, `endpoint`, and `provider` remain accepted. `url` is always the media destination; `link` supplies Referer/Origin context; `endpoint` cannot override automatic routing; direct media classification takes precedence over a provider hint.
+
+`/` and `/interaction/resolve.html` retain their existing response envelopes. Gateway routes support GET, HEAD, ranges, CORS, streaming passthrough, bounded HLS rewriting, sanitized redirects, and the existing exact Cloudflare `403 error code: 1003` fallback.
 
 ## Development
 
@@ -86,8 +121,9 @@ npm install
 npx wrangler types
 npm run dev
 npm test
-npm run lint
 npm run typecheck
+npm run lint
+npx wrangler deploy --dry-run
 ```
 
-The Worker accepts only public HTTP(S) target URLs without embedded credentials. It does not create Turnstile cookies, emulate browser TLS/HTTP2 fingerprints, or bypass upstream access controls.
+Tests use compact tables for all providers and focused mocks for redirects, ARD, playback probing, DNS, private targets, timeouts, encoding, and domain-boundary attacks. Provider classification and URL construction do not claim that a current third-party stream is live or playable.

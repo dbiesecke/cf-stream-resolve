@@ -1,7 +1,10 @@
 import { fetchMediaflowGateway, isMediaflowGatewayPath, MediaflowError, publicMediaflowResponse } from "./mediaflow";
 import type { MediaflowConfig } from "./mediaflow";
-import { resolveVideo } from "./resolver";
+import { diagnoseVideo, resolveVideo } from "./resolver";
 import type { ResolveVideoArguments } from "./resolver";
+import { defaultDnsLookup, readBoundedText } from "./network";
+import { publicProviderList } from "./providers";
+import type { DnsLookup } from "./validation";
 import type { ResolveResult } from "./types";
 
 const supportedProtocols = new Set(["2025-03-26", "2025-11-25"]);
@@ -25,7 +28,7 @@ const tool = {
       url: { type: "string", format: "uri", description: "Public HTTP(S) video, manifest, or embed URL." },
       link: { type: "string", format: "uri", description: "Optional public source-page context used only as upstream Referer and Origin." },
       endpoint: { type: "string", const: "/proxy/stream", description: "Compatibility marker; automatic endpoint selection always takes precedence." },
-      provider: { type: "string", description: "Optional MediaFlow extractor provider. Direct media URLs always take precedence." },
+      provider: { type: "string", description: "Optional provider ID or canonical MediaFlow name. Direct media URLs take precedence." },
       redirect_stream: { type: "boolean", description: "Ask a supported MediaFlow extractor to redirect to its stream." },
       transcode: { type: "boolean", description: "Compatibility option; ignored with a warning when unsupported by the configured MediaFlow API." },
       max_res: { type: "boolean", description: "Compatibility option; ignored with a warning when unsupported by the configured MediaFlow API." },
@@ -74,6 +77,13 @@ function json(request: Request, value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
     status,
     headers: { ...cors(request), "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+  });
+}
+
+function publicJson(value: unknown, status = 200): Response {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { ...gatewayCors(), "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
   });
 }
 
@@ -133,7 +143,7 @@ function protocolHeaderValid(request: Request): boolean {
   return !version || supportedProtocols.has(version);
 }
 
-function mcpMessage(message: unknown, request: Request, env: MediaflowConfig, isBatch: boolean): JsonObject | undefined {
+async function mcpMessage(message: unknown, request: Request, env: MediaflowConfig, isBatch: boolean, fetcher: typeof fetch, lookup: DnsLookup): Promise<JsonObject | undefined> {
   if (!isObject(message) || message.jsonrpc !== "2.0" || typeof message.method !== "string" || ("id" in message && !isId(message.id))) return rpcError(null, -32600, "Invalid Request");
   const id = "id" in message ? message.id as JsonRpcId : undefined;
   const params = message.params;
@@ -146,7 +156,7 @@ function mcpMessage(message: unknown, request: Request, env: MediaflowConfig, is
     return rpcResult(id, {
       protocolVersion: params.protocolVersion === latestProtocol ? latestProtocol : "2025-03-26",
       capabilities: { tools: {} },
-      serverInfo: { name: "cf-stream-resolve", version: "0.4.0" },
+      serverInfo: { name: "cf-stream-resolve", version: "0.5.0" },
       instructions: "Use resolve_video to create the correct Worker-local playback URL for public HTTP(S) media. YouTube remains direct. The server never exposes MediaFlow credentials.",
     });
   }
@@ -159,14 +169,14 @@ function mcpMessage(message: unknown, request: Request, env: MediaflowConfig, is
   if (message.method === "tools/call") {
     if (id === undefined) return undefined;
     if (!isObject(params) || params.name !== tool.name || !validToolArguments(params.arguments)) return rpcError(id, -32602, "Invalid params", "Use name 'resolve_video' with a valid arguments object.");
-    const resolved = resolveVideo(new URL(request.url).origin, params.arguments, env);
+    const resolved = await resolveVideo(new URL(request.url).origin, params.arguments, env, fetcher, lookup);
     if (resolved.outcome !== "ok") return rpcResult(id, { content: [{ type: "text", text: JSON.stringify({ outcome: resolved.outcome, message: resolved.message }) }], isError: true });
     return rpcResult(id, { content: [{ type: "text", text: JSON.stringify(resolved.data) }], structuredContent: resolved.data });
   }
   return id === undefined ? undefined : rpcError(id, -32601, "Method not found");
 }
 
-async function mcp(request: Request, env: MediaflowConfig): Promise<Response> {
+async function mcp(request: Request, env: MediaflowConfig, fetcher: typeof fetch, lookup: DnsLookup): Promise<Response> {
   if (!validOrigin(request)) return json(request, rpcError(null, -32000, "Forbidden"), 403);
   if (!hasJsonContentType(request)) return json(request, rpcError(null, -32600, "Content-Type must be application/json"), 415);
   if (!acceptsJson(request)) return json(request, rpcError(null, -32600, "Accept must include application/json"), 406);
@@ -175,10 +185,11 @@ async function mcp(request: Request, env: MediaflowConfig): Promise<Response> {
   try { parsed = await request.json(); } catch { return json(request, rpcError(null, -32700, "Parse error"), 400); }
   if (Array.isArray(parsed)) {
     if (!parsed.length) return json(request, rpcError(null, -32600, "Invalid Request"), 400);
-    const responses = parsed.map((message) => mcpMessage(message, request, env, true)).filter((message): message is JsonObject => Boolean(message));
+    const values = await Promise.all(parsed.map((message) => mcpMessage(message, request, env, true, fetcher, lookup)));
+    const responses = values.filter((message): message is JsonObject => Boolean(message));
     return responses.length ? json(request, responses) : new Response(null, { status: 202, headers: cors(request) });
   }
-  const response = mcpMessage(parsed, request, env, false);
+  const response = await mcpMessage(parsed, request, env, false, fetcher, lookup);
   return response ? json(request, response) : new Response(null, { status: 202, headers: cors(request) });
 }
 
@@ -194,28 +205,51 @@ function requestArguments(url: URL): ResolveVideoArguments {
   };
 }
 
-export async function handle(request: Request, env: MediaflowConfig, fetcher: typeof fetch = fetch): Promise<Response> {
+export async function handle(request: Request, env: MediaflowConfig, fetcher: typeof fetch = fetch, lookup: DnsLookup = defaultDnsLookup): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname === "/mcp" && !validOrigin(request)) return json(request, { error: "Forbidden origin." }, 403);
-  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: isMediaflowGatewayPath(url.pathname) ? gatewayCors() : cors(request) });
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: isMediaflowGatewayPath(url.pathname) || url.pathname.startsWith("/resolve/") ? gatewayCors() : cors(request) });
+
+  if (url.pathname === "/resolve/providers") {
+    if (request.method !== "GET") return new Response(null, { status: 405, headers: { ...gatewayCors(), allow: "GET" } });
+    return publicJson({ providers: publicProviderList() });
+  }
+
+  if (url.pathname === "/resolve/diagnose") {
+    if (request.method !== "POST") return new Response(null, { status: 405, headers: { ...gatewayCors(), allow: "POST" } });
+    if (!hasJsonContentType(request)) return publicJson({ error: { code: "INVALID_URL", message: "Content-Type must be application/json." } }, 415);
+    let body: unknown;
+    try { body = JSON.parse(await readBoundedText(new Response(request.body), 16 * 1024)); }
+    catch { return publicJson({ error: { code: "INVALID_URL", message: "The request body must be valid JSON up to 16 KiB." } }, 400); }
+    const valid = isObject(body)
+      && Object.keys(body).every((key) => ["url", "redirectStream", "checkPlayback"].includes(key))
+      && typeof body.url === "string"
+      && (body.redirectStream === undefined || typeof body.redirectStream === "boolean")
+      && (body.checkPlayback === undefined || typeof body.checkPlayback === "boolean");
+    if (!valid) return publicJson({ error: { code: "INVALID_URL", message: "Use url with optional redirectStream and checkPlayback booleans." } }, 400);
+    const diagnosticRequest = body as JsonObject;
+    const result = await diagnoseVideo(url.origin, { url: diagnosticRequest.url as string, redirectStream: diagnosticRequest.redirectStream as boolean | undefined, checkPlayback: diagnosticRequest.checkPlayback as boolean | undefined }, env, fetcher, lookup);
+    const responseStatus = result.status === "failed" ? (result.error?.code === "TIMEOUT" ? 504 : result.error?.code === "CONFIGURATION" ? 500 : 400) : result.status === "unsupported" ? 422 : 200;
+    return publicJson(result, responseStatus);
+  }
 
   if (url.pathname === "/mcp") {
     if (request.method !== "POST") return new Response(null, { status: 405, headers: { ...cors(request), allow: "POST" } });
-    return mcp(request, env);
+    return mcp(request, env, fetcher, lookup);
   }
 
   if (isMediaflowGatewayPath(url.pathname)) {
     if (request.method !== "GET" && request.method !== "HEAD") return new Response(null, { status: 405, headers: { ...gatewayCors(), allow: "GET, HEAD" } });
     try {
-      const { response, target } = await fetchMediaflowGateway(request, env, fetcher);
+      const { response, target } = await fetchMediaflowGateway(request, env, fetcher, lookup);
       return await publicMediaflowResponse(response, target, request, env, gatewayCors());
     } catch (error) {
       const failure = error instanceof MediaflowError ? error : new MediaflowError("upstream_error", "The MediaFlow proxy request failed.");
-      return json(request, { error: failure.message }, errorStatus(failure));
+      return publicJson({ error: failure.message }, errorStatus(failure));
     }
   }
 
-  const resolved = resolveVideo(url.origin, requestArguments(url), env);
+  const resolved = await resolveVideo(url.origin, requestArguments(url), env, fetcher, lookup);
   if (url.pathname === "/interaction/resolve.html") {
     return resolved.outcome === "ok"
       ? json(request, { url: resolved.data.url, label: resolved.data.source, ...(resolved.data.mediaType ? { mediaType: resolved.data.mediaType } : {}), ...(resolved.data.warnings ? { warnings: resolved.data.warnings } : {}) })

@@ -1,0 +1,312 @@
+openapi: 3.1.1
+info:
+  title: cf-stream-resolve API
+  version: 0.5.0
+  description: Classifies public video URLs and creates Worker-local MediaFlow playback URLs.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: https://resolve.nated.at
+security: []
+paths:
+  /resolve/diagnose:
+    post:
+      operationId: diagnoseStream
+      summary: Diagnose a public stream URL
+      description: Resolves redirects or media pages and optionally probes the generated playback URL.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiagnoseRequest'
+            examples:
+              voe:
+                summary: VOE
+                value: { url: https://voe.sx/e/example, redirectStream: true }
+              voeAlias:
+                summary: VOE alias
+                value: { url: https://ellenpoliticalfollow.com/e/example, redirectStream: true }
+              vidmoly:
+                summary: Vidmoly
+                value: { url: https://vidmoly.biz/embed-example.html, redirectStream: true }
+              doodstream:
+                summary: Doodstream
+                value: { url: https://doodstream.com/e/example, redirectStream: true }
+              streamtape:
+                summary: Streamtape
+                value: { url: https://streamtape.com/e/example, redirectStream: true }
+              filemoon:
+                summary: FileMoon
+                value: { url: https://filemoon.sx/e/example, redirectStream: true }
+              streamwish:
+                summary: StreamWish
+                value: { url: https://streamwish.to/e/example, redirectStream: true }
+              mixdrop:
+                summary: Mixdrop
+                value: { url: https://mixdrop.co/e/example, redirectStream: true }
+              okru:
+                summary: Okru
+                value: { url: https://ok.ru/videoembed/example, redirectStream: true }
+              vixcloud:
+                summary: VixCloud
+                value: { url: https://vixcloud.co/embed/example, redirectStream: true }
+              aniworld:
+                summary: AniWorld redirect
+                value: { url: https://aniworld.to/redirect/4161619, redirectStream: true }
+              hls:
+                summary: Direct HLS manifest
+                value: { url: https://cdn.example/live/index.m3u8, checkPlayback: true }
+              dash:
+                summary: Direct DASH manifest
+                value: { url: https://cdn.example/live/index.mpd }
+              mp4:
+                summary: Direct MP4 file
+                value: { url: https://cdn.example/video/example.mp4 }
+              ardOverview:
+                summary: ARD overview error
+                value: { url: https://www.ardmediathek.de/serie/example/staffel-1/id/1 }
+              unknown:
+                summary: Unknown provider
+                value: { url: https://embed.example/watch/example }
+              ssrf:
+                summary: SSRF rejection
+                value: { url: http://127.0.0.1/video.mp4 }
+      responses:
+        '200':
+          description: Resolution completed or returned a partial diagnostic.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiagnosticResult'
+              examples:
+                resolvedVoe:
+                  value:
+                    inputUrl: https://voe.sx/e/example
+                    normalizedUrl: https://voe.sx/e/example
+                    sourceType: extractor
+                    provider: voe
+                    mediaFlowProvider: Voe
+                    confidence: high
+                    matchedRule: provider-host
+                    redirectChain: []
+                    resolvedSourceUrl: https://voe.sx/e/example
+                    mediaFlowEndpoint: /extractor/video.m3u8
+                    playbackUrl: https://resolve.nated.at/extractor/video.m3u8?d=https%3A%2F%2Fvoe.sx%2Fe%2Fexample&host=Voe&redirect_stream=true
+                    redirectStream: true
+                    httpStatus: null
+                    contentType: null
+                    finalUrl: null
+                    durationMs: null
+                    cors: not_checked
+                    bodySize: null
+                    manifestDetected: false
+                    stage: playback_url_created
+                    status: resolved
+                    warnings: []
+                    error: null
+        '400':
+          description: The request or target URL is invalid or blocked.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/DiagnosticResult'
+                  - $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                ssrfBlocked:
+                  value: { error: { code: SSRF_BLOCKED, message: This host is not publicly routable. } }
+        '415':
+          description: The request does not use application/json.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '422':
+          description: The URL is valid but its source type is unsupported.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiagnosticResult'
+        '500':
+          description: MediaFlow configuration is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiagnosticResult'
+        '504':
+          description: The resolution or playback check timed out.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiagnosticResult'
+  /resolve/providers:
+    get:
+      operationId: listStreamProviders
+      summary: List supported extractor providers
+      description: Returns public provider IDs, canonical MediaFlow names, endpoints, and redirect support.
+      responses:
+        '200':
+          description: Supported provider metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [providers]
+                properties:
+                  providers:
+                    type: array
+                    minItems: 24
+                    items:
+                      $ref: '#/components/schemas/ProviderInfo'
+        '405':
+          description: The endpoint only accepts GET.
+components:
+  schemas:
+    ProviderId:
+      type: string
+      enum: [city, lulustream, turbovidplay, doodstream, maxstream, uqload, f16px, mixdrop, vavoo, fastream, okru, vidfast, filelions, sportsonline, vidmoly, filemoon, streamtape, vidoza, gupload, streamwish, vixcloud, livetv, supervideo, voe]
+    SourceType:
+      type: string
+      enum: [direct_stream, hls, dash, extractor, redirect, aniworld_redirect, ard_mediathek, unknown]
+    ResolveStatus:
+      type: string
+      enum: [resolved, partially_resolved, unsupported, failed]
+    ResolveStage:
+      type: string
+      enum: [classified, playback_url_created, endpoint_reachable, manifest_loaded, playable]
+    Confidence:
+      type: string
+      enum: [high, medium, low]
+    DiagnosticErrorCode:
+      type: string
+      enum: [INVALID_URL, SSRF_BLOCKED, DNS_BLOCKED, REDIRECT_FAILED, REDIRECT_LOOP, TIMEOUT, ARD_NOT_PLAYABLE_ITEM, UNSUPPORTED_SOURCE, UPSTREAM_ERROR, CONFIGURATION]
+    DiagnoseRequest:
+      type: object
+      additionalProperties: false
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: Public HTTP or HTTPS video, manifest, embed, redirect, or mediathek URL.
+        redirectStream:
+          type: boolean
+          default: false
+          description: Requests a stream redirect only when an extractor supports it.
+        checkPlayback:
+          type: boolean
+          default: false
+          description: Runs an opt-in HEAD and bounded Range GET playback probe.
+    ProviderInfo:
+      type: object
+      additionalProperties: false
+      required: [id, mediaFlowName, preferredEndpoint, supportsRedirectStream]
+      properties:
+        id:
+          $ref: '#/components/schemas/ProviderId'
+        mediaFlowName:
+          type: string
+        preferredEndpoint:
+          type: string
+          enum: [video, video.m3u8, video.mp4]
+        supportsRedirectStream:
+          type: boolean
+    RedirectHop:
+      type: object
+      additionalProperties: false
+      required: [url, status]
+      properties:
+        url:
+          type: string
+          format: uri
+        status:
+          type: integer
+          minimum: 0
+          maximum: 599
+    DiagnosticError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          $ref: '#/components/schemas/DiagnosticErrorCode'
+        message:
+          type: string
+          maxLength: 500
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/DiagnosticError'
+    DiagnosticResult:
+      type: object
+      additionalProperties: false
+      required: [inputUrl, normalizedUrl, sourceType, provider, mediaFlowProvider, confidence, matchedRule, redirectChain, resolvedSourceUrl, mediaFlowEndpoint, playbackUrl, redirectStream, httpStatus, contentType, finalUrl, durationMs, cors, bodySize, manifestDetected, stage, status, warnings, error]
+      properties:
+        inputUrl:
+          type: string
+        normalizedUrl:
+          type: [string, 'null']
+          format: uri
+        sourceType:
+          $ref: '#/components/schemas/SourceType'
+        provider:
+          oneOf:
+            - $ref: '#/components/schemas/ProviderId'
+            - type: 'null'
+        mediaFlowProvider:
+          type: [string, 'null']
+        confidence:
+          $ref: '#/components/schemas/Confidence'
+        matchedRule:
+          type: [string, 'null']
+        redirectChain:
+          type: array
+          maxItems: 6
+          items:
+            $ref: '#/components/schemas/RedirectHop'
+        resolvedSourceUrl:
+          type: [string, 'null']
+          format: uri
+        mediaFlowEndpoint:
+          type: [string, 'null']
+        playbackUrl:
+          type: [string, 'null']
+          format: uri
+        redirectStream:
+          type: boolean
+        httpStatus:
+          type: [integer, 'null']
+        contentType:
+          type: [string, 'null']
+        finalUrl:
+          type: [string, 'null']
+          format: uri
+        durationMs:
+          type: [integer, 'null']
+          minimum: 0
+        cors:
+          type: string
+          enum: [allowed, not_advertised, not_checked]
+        bodySize:
+          type: [integer, 'null']
+          minimum: 0
+        manifestDetected:
+          type: boolean
+        stage:
+          $ref: '#/components/schemas/ResolveStage'
+        status:
+          $ref: '#/components/schemas/ResolveStatus'
+        warnings:
+          type: array
+          items:
+            type: string
+        error:
+          oneOf:
+            - $ref: '#/components/schemas/DiagnosticError'
+            - type: 'null'
