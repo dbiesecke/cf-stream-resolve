@@ -34,7 +34,38 @@ curl -i 'https://YOUR-WORKER.workers.dev/proxy/stream?d=https%3A%2F%2Fvideo.exam
 
 Use `proxyServer=<encoded allowlisted base URL>` to choose a non-default configured server. Arbitrary proxy server URLs are rejected.
 
-`/`, `POST /mcp`, and `/interaction/resolve.html` remain available. Their existing `url` parameter is converted into a Worker-local `/proxy/stream?d=…` URL, preserving the prior JSON and MSX response contracts. They also accept `proxyServer`, `redirect_stream`, `transcode`, and `max_res`.
+`/` and `/interaction/resolve.html` remain available. Their existing `url` parameter is converted into a Worker-local `/proxy/stream?d=…` URL, preserving the prior JSON and MSX response contracts. They also accept `proxyServer`, `redirect_stream`, `transcode`, and `max_res`.
+
+## MCP
+
+`POST /mcp` is a stateless Streamable HTTP MCP Tool Server. It supports protocol versions `2025-11-25` and `2025-03-26`, JSON-RPC batches, `initialize`, `notifications/initialized`, `ping`, `tools/list`, and `tools/call`. The endpoint exposes one deterministic, read-only and idempotent tool: `resolve_video`.
+
+Clients should send `Content-Type: application/json` and an `Accept` header that includes both `application/json` and `text/event-stream`. This server does not offer an SSE stream or session management, so `GET /mcp` and `DELETE /mcp` return `405 Method Not Allowed`. Browser requests must use the Worker origin; non-browser clients may omit `Origin`.
+
+Initialize the connection:
+
+```sh
+curl -X POST https://YOUR-WORKER.workers.dev/mcp \
+  -H 'content-type: application/json' \
+  -H 'accept: application/json, text/event-stream' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0.0"}}}'
+```
+
+Discover and call the tool:
+
+```sh
+curl -X POST https://YOUR-WORKER.workers.dev/mcp \
+  -H 'content-type: application/json' \
+  -H 'accept: application/json, text/event-stream' \
+  --data '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+
+curl -X POST https://YOUR-WORKER.workers.dev/mcp \
+  -H 'content-type: application/json' \
+  -H 'accept: application/json, text/event-stream' \
+  --data '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"resolve_video","arguments":{"url":"https://video.example/embed/abc","max_res":true}}}'
+```
+
+The tool only creates a Worker-local proxy URL. It does not fetch media during the call, bypass access controls, or expose MediaFlow credentials.
 
 ## Development
 
