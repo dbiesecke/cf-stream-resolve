@@ -90,6 +90,8 @@ curl https://resolve.btc-mining.at/resolve/providers
 
 The response exposes only provider IDs, canonical MediaFlow names, preferred endpoints, and redirect support. The complete OpenAPI 3.1.1 contract and examples are in [`openapi.yaml`](openapi.yaml).
 
+Runnable REST, playback, configuration, and MCP examples are maintained in [`docs/usage.md`](docs/usage.md).
+
 ## Redirects, AniWorld, and ARD
 
 AniWorld episode pages are loaded through internal MediaFlow Forward and searched for registered provider URLs. One target continues through the normal extractor flow; multiple targets return `partially_resolved`. AniWorld `/redirect/` stays on manual Worker redirects because Forward does not expose its final redirect URL.
