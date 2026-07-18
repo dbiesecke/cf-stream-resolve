@@ -33,6 +33,7 @@ const gatewayPaths = new Set([
   "/extractor/video.mp4",
 ]);
 const hlsSegmentPath = /^\/proxy\/hls\/segment\.(?:ts|m4s|mp4|m4a|m4v|aac)$/;
+const signedMediaflowPath = /^\/_token_[A-Za-z0-9_-]{32,4096}\/(?:proxy|extractor)\/[A-Za-z0-9._/-]{1,256}$/;
 const requestHeaders = new Set(["accept", "content-type", "if-range", "range"]);
 
 function configuredServers(env: MediaflowConfig): string[] {
@@ -57,10 +58,11 @@ function apiPassword(env: MediaflowConfig): string {
 }
 
 export function isMediaflowGatewayPath(pathname: string): boolean {
-  return gatewayPaths.has(pathname) || hlsSegmentPath.test(pathname);
+  return gatewayPaths.has(pathname) || hlsSegmentPath.test(pathname) || signedMediaflowPath.test(pathname);
 }
 
 function allowedParameter(pathname: string, name: string): boolean {
+  if (signedMediaflowPath.test(pathname)) return false;
   const lower = name.toLowerCase();
   if (lower === "d" || lower.startsWith("h_") || lower.startsWith("r_") || lower.startsWith("rp_")) return true;
   if (pathname === "/proxy/hls/manifest.m3u8") return lower === "key_url";
@@ -110,12 +112,33 @@ function directFallbackHeaders(request: Request, params: URLSearchParams): Heade
   return headers;
 }
 
-async function fetchWithHeaderTimeout(target: URL, init: RequestInit, fetcher: typeof fetch): Promise<Response> {
+async function fetchWithHeaderTimeout(target: URL, init: RequestInit, fetcher: typeof fetch, timeoutMs = HEADER_TIMEOUT_MS): Promise<Response> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), HEADER_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try { return await fetcher(target, { ...init, signal: controller.signal }); }
   catch (error) { throw new MediaflowError((error as Error).name === "AbortError" ? "timeout" : "upstream_error", "The MediaFlow proxy request failed."); }
   finally { clearTimeout(timer); }
+}
+
+export async function fetchMediaflowForwardPage(
+  destination: URL,
+  env: MediaflowConfig,
+  fetcher: typeof fetch = fetch,
+  lookup: DnsLookup = defaultDnsLookup,
+  timeoutMs = 8_000,
+): Promise<Response> {
+  const normalized = validatePublicUrl(destination.href);
+  await validateResolvedAddresses(normalized, lookup);
+  const server = selectedServer(env);
+  await validateResolvedAddresses(server, lookup);
+  const target = new URL("/proxy/forward", `${server.href}/`);
+  target.searchParams.set("d", normalized.href);
+  target.searchParams.set("h_accept", "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.1");
+  target.searchParams.set("h_user-agent", "cf-stream-resolve/0.5.1");
+  target.searchParams.set("h_referer", normalized.href);
+  target.searchParams.set("h_origin", normalized.origin);
+  target.searchParams.set("api_password", apiPassword(env));
+  return fetchWithHeaderTimeout(target, { method: "GET", redirect: "manual" }, fetcher, timeoutMs);
 }
 
 async function isCloudflare1003(response: Response): Promise<boolean> {
@@ -155,8 +178,8 @@ function publicUrlForMediaflowUrl(raw: string, publicOrigin: string, target: URL
     try { parsed = new URL(raw, destination); } catch { return raw; }
   }
 
-  const upstreamOrigins = new Set(configuredServers(env).map((server) => new URL(server).origin));
-  if (upstreamOrigins.has(parsed.origin)) {
+  const upstreamHosts = new Set(configuredServers(env).map((server) => new URL(server).hostname));
+  if (upstreamHosts.has(parsed.hostname)) {
     const publicUrl = new URL(parsed.pathname, publicOrigin);
     for (const [name, value] of parsed.searchParams) if (name.toLowerCase() !== "api_password") publicUrl.searchParams.append(name, value);
     return publicUrl.href;

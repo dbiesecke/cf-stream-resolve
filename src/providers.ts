@@ -60,6 +60,14 @@ function domainMatches(hostname: string, domain: string): boolean {
   return hostname === domain || hostname.endsWith(`.${domain}`);
 }
 
+const forwardSourceHosts = ["aniworld.to", "ardmediathek.de"] as const;
+
+export function isKnownForwardTarget(url: URL): boolean {
+  const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+  return forwardSourceHosts.some((host) => domainMatches(hostname, host))
+    || PROVIDERS.some((provider) => provider.hosts.some((host) => domainMatches(hostname, host)));
+}
+
 export function providerFromUrl(url: URL): ProviderDefinition | undefined {
   const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
   for (const provider of PROVIDERS) {

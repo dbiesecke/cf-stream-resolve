@@ -1,13 +1,13 @@
 openapi: 3.1.1
 info:
   title: cf-stream-resolve API
-  version: 0.5.0
-  description: Classifies public video URLs and creates Worker-local MediaFlow playback URLs.
+  version: 0.5.1
+  description: Classifies public video URLs and creates Worker-local MediaFlow playback URLs with bounded internal page resolution.
   license:
     name: MIT
     identifier: MIT
 servers:
-  - url: https://resolve.nated.at
+  - url: https://resolve.btc-mining.at
 security: []
 paths:
   /resolve/diagnose:
@@ -55,6 +55,9 @@ paths:
               aniworld:
                 summary: AniWorld redirect
                 value: { url: https://aniworld.to/redirect/4161619, redirectStream: true }
+              aniworldEpisode:
+                summary: AniWorld episode through internal Forward
+                value: { url: https://aniworld.to/anime/stream/example/staffel-1/episode-1, redirectStream: true }
               hls:
                 summary: Direct HLS manifest
                 value: { url: https://cdn.example/live/index.m3u8, checkPlayback: true }
@@ -90,11 +93,39 @@ paths:
                     mediaFlowProvider: Voe
                     confidence: high
                     matchedRule: provider-host
+                    resolutionTransport: none
                     redirectChain: []
                     resolvedSourceUrl: https://voe.sx/e/example
                     mediaFlowEndpoint: /extractor/video.m3u8
-                    playbackUrl: https://resolve.nated.at/extractor/video.m3u8?d=https%3A%2F%2Fvoe.sx%2Fe%2Fexample&host=Voe&redirect_stream=true
+                    playbackUrl: https://resolve.btc-mining.at/extractor/video.m3u8?d=https%3A%2F%2Fvoe.sx%2Fe%2Fexample&host=Voe&redirect_stream=true
                     redirectStream: true
+                    httpStatus: null
+                    contentType: null
+                    finalUrl: null
+                    durationMs: null
+                    cors: not_checked
+                    bodySize: null
+                    manifestDetected: false
+                    stage: playback_url_created
+                    status: resolved
+                    warnings: []
+                    error: null
+                forwardedAniWorld:
+                  value:
+                    inputUrl: https://aniworld.to/anime/stream/example/staffel-1/episode-1
+                    normalizedUrl: https://aniworld.to/anime/stream/example/staffel-1/episode-1
+                    sourceType: aniworld_page
+                    provider: vidmoly
+                    mediaFlowProvider: Vidmoly
+                    confidence: high
+                    matchedRule: redirect-target-host
+                    resolutionTransport: mediaflow_forward
+                    redirectChain:
+                      - { url: https://aniworld.to/anime/stream/example/staffel-1/episode-1, status: 200 }
+                    resolvedSourceUrl: https://vidmoly.biz/embed-example.html
+                    mediaFlowEndpoint: /extractor/video.m3u8
+                    playbackUrl: https://resolve.btc-mining.at/extractor/video.m3u8?d=https%3A%2F%2Fvidmoly.biz%2Fembed-example.html&host=Vidmoly
+                    redirectStream: false
                     httpStatus: null
                     contentType: null
                     finalUrl: null
@@ -129,6 +160,33 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DiagnosticResult'
+              examples:
+                unknownHost:
+                  value:
+                    inputUrl: https://embed.example/watch/example
+                    normalizedUrl: https://embed.example/watch/example
+                    sourceType: unknown
+                    provider: null
+                    mediaFlowProvider: null
+                    confidence: low
+                    matchedRule: null
+                    resolutionTransport: none
+                    redirectChain: []
+                    resolvedSourceUrl: null
+                    mediaFlowEndpoint: null
+                    playbackUrl: null
+                    redirectStream: false
+                    httpStatus: null
+                    contentType: null
+                    finalUrl: null
+                    durationMs: null
+                    cors: not_checked
+                    bodySize: null
+                    manifestDetected: false
+                    stage: classified
+                    status: unsupported
+                    warnings: []
+                    error: { code: UNSUPPORTED_SOURCE, message: This source is not supported. }
         '500':
           description: MediaFlow configuration is unavailable.
           content:
@@ -170,7 +228,10 @@ components:
       enum: [city, lulustream, turbovidplay, doodstream, maxstream, uqload, f16px, mixdrop, vavoo, fastream, okru, vidfast, filelions, sportsonline, vidmoly, filemoon, streamtape, vidoza, gupload, streamwish, vixcloud, livetv, supervideo, voe]
     SourceType:
       type: string
-      enum: [direct_stream, hls, dash, extractor, redirect, aniworld_redirect, ard_mediathek, unknown]
+      enum: [direct_stream, hls, dash, extractor, redirect, aniworld_redirect, aniworld_page, ard_mediathek, unknown]
+    ResolutionTransport:
+      type: string
+      enum: [none, worker_direct, mediaflow_forward]
     ResolveStatus:
       type: string
       enum: [resolved, partially_resolved, unsupported, failed]
@@ -246,7 +307,7 @@ components:
     DiagnosticResult:
       type: object
       additionalProperties: false
-      required: [inputUrl, normalizedUrl, sourceType, provider, mediaFlowProvider, confidence, matchedRule, redirectChain, resolvedSourceUrl, mediaFlowEndpoint, playbackUrl, redirectStream, httpStatus, contentType, finalUrl, durationMs, cors, bodySize, manifestDetected, stage, status, warnings, error]
+      required: [inputUrl, normalizedUrl, sourceType, provider, mediaFlowProvider, confidence, matchedRule, resolutionTransport, redirectChain, resolvedSourceUrl, mediaFlowEndpoint, playbackUrl, redirectStream, httpStatus, contentType, finalUrl, durationMs, cors, bodySize, manifestDetected, stage, status, warnings, error]
       properties:
         inputUrl:
           type: string
@@ -265,6 +326,8 @@ components:
           $ref: '#/components/schemas/Confidence'
         matchedRule:
           type: [string, 'null']
+        resolutionTransport:
+          $ref: '#/components/schemas/ResolutionTransport'
         redirectChain:
           type: array
           maxItems: 6

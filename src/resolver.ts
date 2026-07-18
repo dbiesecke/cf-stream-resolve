@@ -1,7 +1,7 @@
-import { assertMediaflowConfigured, MediaflowError } from "./mediaflow";
+import { assertMediaflowConfigured, fetchMediaflowForwardPage, MediaflowError } from "./mediaflow";
 import type { MediaflowConfig } from "./mediaflow";
 import { checkedFetch, defaultDnsLookup, fetchWithTimeout, readBoundedText, readUpToBytes } from "./network";
-import { providerById, providerFromName, providerFromUrl } from "./providers";
+import { isKnownForwardTarget, providerById, providerFromName, providerFromUrl } from "./providers";
 import type { ExtractorProvider } from "./providers";
 import type { ClassificationResult, DiagnosticErrorCode, MediaType, ResolveDiagnostic, ResolveResult, SourceType } from "./types";
 import { validatePublicUrl } from "./validation";
@@ -52,6 +52,7 @@ export function classifySource(input: string | URL): ClassificationResult {
   if (pathEndsWith(url, [".mpd"])) return { sourceType: "dash", provider: null, confidence: "high", matchedRule: "path-extension-dash" };
   if (pathEndsWith(url, mediaExtensions)) return { sourceType: "direct_stream", provider: null, confidence: "high", matchedRule: "path-extension-media" };
   if (exactDomain(url.hostname, "aniworld.to") && /^\/redirect\//i.test(url.pathname)) return { sourceType: "aniworld_redirect", provider: null, confidence: "high", matchedRule: "aniworld-redirect-path" };
+  if (exactDomain(url.hostname, "aniworld.to") && /^\/anime\/stream\//i.test(url.pathname)) return { sourceType: "aniworld_page", provider: null, confidence: "high", matchedRule: "aniworld-episode-path" };
   if (exactDomain(url.hostname, "ardmediathek.de")) return { sourceType: "ard_mediathek", provider: null, confidence: "high", matchedRule: "ard-mediathek-host" };
   const provider = providerFromUrl(url);
   if (provider) return { sourceType: "extractor", provider: provider.id, confidence: "high", matchedRule: "provider-host" };
@@ -91,7 +92,7 @@ export function buildPlaybackUrl(input: {
 function emptyDiagnostic(inputUrl: string): ResolveDiagnostic {
   return {
     inputUrl, normalizedUrl: null, sourceType: "unknown", provider: null, mediaFlowProvider: null,
-    confidence: "low", matchedRule: null, redirectChain: [], resolvedSourceUrl: null,
+    confidence: "low", matchedRule: null, resolutionTransport: "none", redirectChain: [], resolvedSourceUrl: null,
     mediaFlowEndpoint: null, playbackUrl: null, redirectStream: false, httpStatus: null,
     contentType: null, finalUrl: null, durationMs: null, cors: "not_checked", bodySize: null,
     manifestDetected: false, stage: "classified", status: "failed", warnings: [], error: null,
@@ -138,15 +139,31 @@ function isArdOverview(url: URL): boolean {
 
 interface PageResolution { url: URL | null; classification: ClassificationResult | null; warnings: string[]; partial: boolean; }
 
-async function resolvePage(
+function selectPageCandidate(html: string, base: URL, initialType: SourceType): PageResolution {
+  const candidates = candidateUrls(html, base).map((url) => ({ url, classification: classifySource(url) }))
+    .filter(({ classification }) => ["hls", "dash", "direct_stream", "extractor"].includes(classification.sourceType));
+  const unique = [...new Map(candidates.map((candidate) => [candidate.url.href, candidate])).values()];
+  if (!unique.length) {
+    throw new ResolverError("UNSUPPORTED_SOURCE", initialType === "ard_mediathek"
+      ? "No playable media URL was found in the ARD item."
+      : "No supported provider URL was found in the AniWorld item.");
+  }
+  if (initialType !== "ard_mediathek" && unique.length > 1) {
+    return { url: null, classification: null, warnings: ["Multiple supported media targets were found; no arbitrary target was selected."], partial: true };
+  }
+  const selected = initialType === "ard_mediathek"
+    ? unique.find(({ classification }) => classification.sourceType === "hls") ?? unique.find(({ classification }) => classification.sourceType === "dash") ?? unique[0]
+    : unique[0];
+  return { url: selected.url, classification: selected.classification, warnings: [], partial: false };
+}
+
+async function resolveDirectRedirect(
   start: URL,
-  initialType: SourceType,
   diagnostic: ResolveDiagnostic,
   fetcher: typeof fetch,
   lookup: DnsLookup,
   deadline: number,
 ): Promise<PageResolution> {
-  if (initialType === "ard_mediathek" && isArdOverview(start)) throw new ResolverError("ARD_NOT_PLAYABLE_ITEM", "Die URL verweist auf eine Serien- oder Staffelübersicht.");
   const seen = new Set<string>();
   let current = start;
   for (let step = 0; step <= MAX_REDIRECTS; step += 1) {
@@ -171,20 +188,33 @@ async function resolvePage(
     const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
     if (!contentType.includes("html") && !contentType.includes("json") && contentType) throw new ResolverError("REDIRECT_FAILED", "The page did not return redirect-compatible content.");
     const html = await readBoundedText(response, MAX_HTML_BYTES);
-    const candidates = candidateUrls(html, current).map((url) => ({ url, classification: classifySource(url) }))
-      .filter(({ classification }) => ["hls", "dash", "direct_stream", "extractor"].includes(classification.sourceType));
-    const unique = [...new Map(candidates.map((candidate) => [candidate.url.href, candidate])).values()];
-    if (!unique.length) {
-      const code = initialType === "ard_mediathek" ? "UNSUPPORTED_SOURCE" : "REDIRECT_FAILED";
-      throw new ResolverError(code, initialType === "ard_mediathek" ? "No playable media URL was found in the ARD item." : "No supported redirect target was found.");
-    }
-    if (initialType !== "ard_mediathek" && unique.length > 1) return { url: null, classification: null, warnings: ["Multiple supported media targets were found; no arbitrary target was selected."], partial: true };
-    const selected = initialType === "ard_mediathek"
-      ? unique.find(({ classification }) => classification.sourceType === "hls") ?? unique.find(({ classification }) => classification.sourceType === "dash") ?? unique[0]
-      : unique[0];
-    return { url: selected.url, classification: selected.classification, warnings: [], partial: false };
+    return selectPageCandidate(html, current, "aniworld_redirect");
   }
   throw new ResolverError("REDIRECT_FAILED", `More than ${MAX_REDIRECTS} redirects were returned.`);
+}
+
+async function resolveForwardPage(
+  start: URL,
+  initialType: "aniworld_page" | "ard_mediathek",
+  diagnostic: ResolveDiagnostic,
+  env: MediaflowConfig,
+  fetcher: typeof fetch,
+  lookup: DnsLookup,
+  deadline: number,
+): Promise<PageResolution> {
+  if (!isKnownForwardTarget(start)) throw new ResolverError("UNSUPPORTED_SOURCE", "The page host is not permitted for MediaFlow forwarding.");
+  if (Date.now() > deadline) throw new ResolverError("TIMEOUT", "The resolver exceeded its total time limit.");
+  let response: Response;
+  try {
+    response = await fetchMediaflowForwardPage(start, env, fetcher, lookup, Math.min(8_000, Math.max(1, deadline - Date.now())));
+  } catch (error) { throw errorFrom(error); }
+  diagnostic.redirectChain.push({ url: start.href, status: response.status });
+  if (!response.ok) throw new ResolverError("UPSTREAM_ERROR", `MediaFlow forward returned HTTP ${response.status}.`);
+  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  if (!contentType.includes("html") && !contentType.includes("json") && contentType) throw new ResolverError("UPSTREAM_ERROR", "MediaFlow forward did not return HTML or JSON.");
+  if (initialType === "ard_mediathek" && isArdOverview(start)) throw new ResolverError("ARD_NOT_PLAYABLE_ITEM", "Die URL verweist auf eine Serien- oder Staffelübersicht.");
+  const html = await readBoundedText(response, MAX_HTML_BYTES);
+  return selectPageCandidate(html, start, initialType);
 }
 
 function mediaTypeFor(sourceType: SourceType): MediaType {
@@ -253,10 +283,18 @@ export async function diagnoseVideo(
       return diagnostic;
     }
 
+    if (["unknown", "redirect"].includes(classification.sourceType)) {
+      throw new ResolverError("UNSUPPORTED_SOURCE", "The page host is not permitted for server-side resolution.");
+    }
     assertMediaflowConfigured(env);
     let resolved = input;
-    if (["aniworld_redirect", "redirect", "ard_mediathek", "unknown"].includes(classification.sourceType)) {
-      const page = await resolvePage(input, classification.sourceType, diagnostic, fetcher, lookup, Date.now() + TOTAL_TIMEOUT_MS);
+    if (classification.sourceType === "aniworld_redirect" || classification.sourceType === "aniworld_page" || classification.sourceType === "ard_mediathek") {
+      const initialType = classification.sourceType;
+      diagnostic.resolutionTransport = initialType === "aniworld_redirect" ? "worker_direct" : "mediaflow_forward";
+      const deadline = Date.now() + TOTAL_TIMEOUT_MS;
+      const page = initialType === "aniworld_redirect"
+        ? await resolveDirectRedirect(input, diagnostic, fetcher, lookup, deadline)
+        : await resolveForwardPage(input, initialType, diagnostic, env, fetcher, lookup, deadline);
       diagnostic.warnings.push(...page.warnings);
       if (page.partial || !page.url || !page.classification) {
         diagnostic.status = "partially_resolved";

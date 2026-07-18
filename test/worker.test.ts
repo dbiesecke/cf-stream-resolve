@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { handle as workerHandle } from "../src/worker";
 import {
   fetchMediaflowGateway,
@@ -73,6 +73,13 @@ describe("resolve_video routing", () => {
 });
 
 describe("MediaFlow gateway", () => {
+  it("does not expose MediaFlow forward as a public gateway route", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const response = await handle(request(`/proxy/forward?d=${encodeURIComponent("https://aniworld.to/anime/stream/example")}&h_authorization=secret`), env, fetcher);
+    expect(response.status).toBe(404);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("uses only configured servers, appends the secret upstream, and filters unsupported parameters", () => {
     const target = mediaflowGatewayUrl("/proxy/hls/manifest.m3u8", new URLSearchParams({ d: directHls, max_res: "true", h_referer: "https://vidmoly.biz/" }), env);
     expect(target.origin).toBe("https://mediaflow-a.example");
@@ -112,10 +119,11 @@ describe("MediaFlow gateway", () => {
   });
 
   it("rewrites nested HLS URLs, segment URLs, key URLs, and map URLs", async () => {
+    const token = "signed_mediaflow_token_0123456789abcdef";
     const manifest = [
       "#EXTM3U",
       "#EXT-X-STREAM-INF:BANDWIDTH=1000",
-      "https://mediaflow-a.example/proxy/hls/manifest.m3u8?d=https%3A%2F%2Fcdn.example%2Flow.m3u8&api_password=test-secret",
+      `http://mediaflow-a.example/_token_${token}/proxy/hls/manifest`,
       "#EXT-X-MEDIA:TYPE=AUDIO,URI=\"https://cdn.example/audio.m3u8\"",
       "#EXT-X-KEY:METHOD=AES-128,URI=\"https://keys.example/key.bin\"",
       "#EXT-X-MAP:URI=\"init.mp4\"",
@@ -128,10 +136,24 @@ describe("MediaFlow gateway", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("content-length")).toBeNull();
     expect(rewritten).not.toMatch(/test-secret|mediaflow-a\.example/);
-    expect(rewritten).toContain("https://worker.example/proxy/hls/manifest.m3u8");
+    expect(rewritten).toContain(`https://worker.example/_token_${token}/proxy/hls/manifest`);
     expect(rewritten).toContain(encodeURIComponent("https://keys.example/key.bin"));
     expect(rewritten).toContain(encodeURIComponent("https://stream.4fun.tv:8888/hls/4f_high/938694.ts"));
     expect(rewritten.match(/https:\/\/worker\.example/g)?.length).toBeGreaterThanOrEqual(5);
+  });
+
+  it("relays only tightly shaped signed MediaFlow paths without exposing the origin", async () => {
+    const tokenPath = `/_token_${"a".repeat(48)}/proxy/hls/manifest`;
+    const response = await handle(request(tokenPath), env, async (input) => {
+      const target = new URL(input.toString());
+      expect(target.origin).toBe("https://mediaflow-a.example");
+      expect(target.pathname).toBe(tokenPath);
+      return new Response("#EXTM3U", { headers: { "content-type": "application/vnd.apple.mpegurl" } });
+    }, publicDns);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("#EXTM3U");
+    const unsigned = await handle(request("/_token_short/proxy/hls/manifest"), env, fetch, publicDns);
+    expect(unsigned.status).toBe(404);
   });
 
   it("rewrites MediaFlow redirects and removes the password", async () => {

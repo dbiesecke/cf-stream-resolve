@@ -156,7 +156,7 @@ async function mcpMessage(message: unknown, request: Request, env: MediaflowConf
     return rpcResult(id, {
       protocolVersion: params.protocolVersion === latestProtocol ? latestProtocol : "2025-03-26",
       capabilities: { tools: {} },
-      serverInfo: { name: "cf-stream-resolve", version: "0.5.0" },
+      serverInfo: { name: "cf-stream-resolve", version: "0.5.1" },
       instructions: "Use resolve_video to create the correct Worker-local playback URL for public HTTP(S) media. YouTube remains direct. The server never exposes MediaFlow credentials.",
     });
   }

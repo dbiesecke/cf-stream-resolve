@@ -1,17 +1,18 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "cf-stream-resolve",
+  "account_id": "7d42f6d7d6839c9e3c607b7188427e67",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-18",
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
-    "MEDIAFLOW_PROXY_SERVERS": "http://5.161.220.50:8888",
-    "MEDIAFLOW_PROXY_DEFAULT": "http://5.161.220.50:8888"
+    "MEDIAFLOW_PROXY_SERVERS": "https://mediaflow.btc-mining.at",
+    "MEDIAFLOW_PROXY_DEFAULT": "https://mediaflow.btc-mining.at"
   },
   "routes": [
     {
-      "pattern": "resolve.nated.at",
-      "zone_name": "nated.at",
+      "pattern": "resolve.btc-mining.at",
+      "zone_name": "btc-mining.at",
       "custom_domain": true
     }
   ],

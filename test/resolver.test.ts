@@ -38,26 +38,59 @@ describe("provider registry and playback URLs", () => {
 });
 
 describe("redirect, ARD, SSRF, and playback diagnostics", () => {
-  it("resolves AniWorld HTTP redirects and HTML redirects without executing scripts", async () => {
+  it("resolves AniWorld redirects directly and episode pages through MediaFlow forward", async () => {
     const httpFetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 302, headers: { location: "https://voe.sx/e/fixture" } }));
     const http = await diagnoseVideo("https://worker.example", { url: "https://aniworld.to/redirect/1", redirectStream: true }, env, httpFetcher, publicDns);
-    expect(http).toMatchObject({ status: "resolved", sourceType: "aniworld_redirect", provider: "voe", mediaFlowEndpoint: "/extractor/video.m3u8" });
+    expect(http).toMatchObject({ status: "resolved", sourceType: "aniworld_redirect", provider: "voe", mediaFlowEndpoint: "/extractor/video.m3u8", resolutionTransport: "worker_direct" });
     expect(http.redirectChain).toEqual([{ url: "https://aniworld.to/redirect/1", status: 302 }]);
 
-    const htmlFetcher = vi.fn<typeof fetch>(async () => new Response('<meta http-equiv="refresh" content="0; url=https://vidmoly.biz/embed-fixture.html">', { headers: { "content-type": "text/html" } }));
-    const html = await diagnoseVideo("https://worker.example", { url: "https://redirect.example/go/item", redirectStream: true }, env, htmlFetcher, publicDns);
-    expect(html).toMatchObject({ status: "resolved", provider: "vidmoly", mediaFlowEndpoint: "/extractor/video.m3u8" });
+    const htmlFetcher = vi.fn<typeof fetch>(async (input) => {
+      const target = new URL(input.toString());
+      expect(target.pathname).toBe("/proxy/forward");
+      expect(target.searchParams.get("d")).toBe("https://aniworld.to/anime/stream/example/staffel-1/episode-1");
+      expect(target.searchParams.get("api_password")).toBe("test-secret");
+      return new Response('<meta http-equiv="refresh" content="0; url=https://vidmoly.biz/embed-fixture.html">', { headers: { "content-type": "text/html" } });
+    });
+    const html = await diagnoseVideo("https://worker.example", { url: "https://aniworld.to/anime/stream/example/staffel-1/episode-1", redirectStream: true }, env, htmlFetcher, publicDns);
+    expect(html).toMatchObject({ status: "resolved", sourceType: "aniworld_page", provider: "vidmoly", mediaFlowEndpoint: "/extractor/video.m3u8", resolutionTransport: "mediaflow_forward" });
+    expect(JSON.stringify(html)).not.toContain("test-secret");
   });
 
-  it("reports ambiguous embeds and ARD overview pages without choosing media", async () => {
-    const fetcher = vi.fn<typeof fetch>(async () => new Response('<iframe src="https://voe.sx/e/a"></iframe><iframe src="https://vidmoly.biz/embed-b.html"></iframe>', { headers: { "content-type": "text/html" } }));
-    const ambiguous = await diagnoseVideo("https://worker.example", { url: "https://embed.example/watch/1" }, env, fetcher, publicDns);
-    expect(ambiguous).toMatchObject({ status: "partially_resolved", playbackUrl: null });
+  it("reports ambiguous forwarded AniWorld pages and forwarded ARD overviews", async () => {
+    const fetcher = vi.fn<typeof fetch>(async (input) => {
+      const destination = new URL(input.toString()).searchParams.get("d");
+      if (destination?.includes("ardmediathek.de")) return new Response("overview", { headers: { "content-type": "text/html", "content-length": String(512 * 1024 + 1) } });
+      return new Response('<iframe src="https://voe.sx/e/a"></iframe><iframe src="https://vidmoly.biz/embed-b.html"></iframe>', { headers: { "content-type": "text/html" } });
+    });
+    const ambiguous = await diagnoseVideo("https://worker.example", { url: "https://aniworld.to/anime/stream/example/staffel-1/episode-1" }, env, fetcher, publicDns);
+    expect(ambiguous).toMatchObject({ status: "partially_resolved", playbackUrl: null, resolutionTransport: "mediaflow_forward" });
     expect(ambiguous.warnings[0]).toMatch(/Multiple supported/i);
 
     const ard = await diagnoseVideo("https://worker.example", { url: "https://www.ardmediathek.de/serie/example/staffel-1/id/1" }, env, fetcher, publicDns);
-    expect(ard).toMatchObject({ status: "failed", error: { code: "ARD_NOT_PLAYABLE_ITEM" } });
-    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(ard).toMatchObject({ status: "failed", resolutionTransport: "mediaflow_forward", error: { code: "ARD_NOT_PLAYABLE_ITEM" } });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects unknown page hosts without fetching them", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const unknown = await diagnoseVideo("https://worker.example", { url: "https://embed.example/watch/1" }, env, fetcher, publicDns);
+    expect(unknown).toMatchObject({ status: "unsupported", resolutionTransport: "none", error: { code: "UNSUPPORTED_SOURCE" } });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("bounds forwarded pages and validates their DNS before forwarding", async () => {
+    const oversized = vi.fn<typeof fetch>(async () => new Response("x", { headers: { "content-type": "text/html", "content-length": String(512 * 1024 + 1) } }));
+    const large = await diagnoseVideo("https://worker.example", { url: "https://aniworld.to/anime/stream/example/staffel-1/episode-1" }, env, oversized, publicDns);
+    expect(large).toMatchObject({ status: "failed", resolutionTransport: "mediaflow_forward", error: { code: "UPSTREAM_ERROR" } });
+
+    const fetcher = vi.fn<typeof fetch>();
+    const blocked = await diagnoseVideo("https://worker.example", { url: "https://aniworld.to/anime/stream/example/staffel-1/episode-1" }, env, fetcher, async (hostname) => hostname === "aniworld.to" ? ["10.0.0.1"] : ["93.184.216.34"]);
+    expect(blocked).toMatchObject({ status: "failed", error: { code: "DNS_BLOCKED" } });
+    expect(fetcher).not.toHaveBeenCalled();
+
+    const timeoutFetcher = vi.fn<typeof fetch>(async () => { throw new DOMException("timed out", "AbortError"); });
+    const timeout = await diagnoseVideo("https://worker.example", { url: "https://aniworld.to/anime/stream/example/staffel-1/episode-1" }, env, timeoutFetcher, publicDns);
+    expect(timeout).toMatchObject({ status: "failed", resolutionTransport: "mediaflow_forward", error: { code: "TIMEOUT" } });
   });
 
   it("blocks credentials, private addresses, private DNS, and private redirect targets", async () => {

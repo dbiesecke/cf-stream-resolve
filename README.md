@@ -8,12 +8,12 @@ Every request uses one pipeline:
 
 1. Validate and normalize the public HTTP(S) URL.
 2. Detect direct files, HLS, DASH, AniWorld, ARD, or a registered extractor provider.
-3. Resolve bounded HTTP/HTML redirects or a concrete ARD item when required.
+3. Load known AniWorld episode and concrete ARD pages internally through MediaFlow Forward; keep AniWorld `/redirect/` on bounded Worker redirects.
 4. Classify the resolved URL again.
 5. Build one Worker-local MediaFlow URL with `URLSearchParams`.
 6. Optionally probe playback with HEAD and a bounded Range GET.
 
-Unknown web pages are never sent blindly to `/proxy/stream`. HTML inspection recognizes only URLs, meta refreshes, simple location assignments, and `location.replace()`. It does not execute JavaScript or emulate a browser.
+Unknown web pages are neither fetched nor sent blindly to `/proxy/stream`. Forward is limited to registry hosts, AniWorld, and ARD. HTML inspection recognizes only URLs, meta refreshes, simple location assignments, and `location.replace()`. It never executes JavaScript.
 
 ## Configuration
 
@@ -22,8 +22,8 @@ Configure a comma-separated allowlist and an optional default. The default must 
 ```jsonc
 {
   "vars": {
-    "MEDIAFLOW_PROXY_SERVERS": "https://mediaflow-1.example,https://mediaflow-2.example",
-    "MEDIAFLOW_PROXY_DEFAULT": "https://mediaflow-1.example"
+    "MEDIAFLOW_PROXY_SERVERS": "https://mediaflow.btc-mining.at",
+    "MEDIAFLOW_PROXY_DEFAULT": "https://mediaflow.btc-mining.at"
   }
 }
 ```
@@ -35,6 +35,8 @@ npx wrangler secret put MEDIAFLOW_API_PASSWORD
 ```
 
 Clients cannot select a MediaFlow server. `MEDIAFLOW_API_PASSWORD` is added only to upstream requests and is removed from public URLs, rewritten manifests, and relayed redirects.
+
+The MediaFlow origin terminates HTTPS on port 443 and forwards privately to its Python service on `127.0.0.1:8888`. Public port 8888 should remain closed. The same strong password is configured as MediaFlow `API_PASSWORD` and as the Worker secret.
 
 ## Provider registry
 
@@ -65,7 +67,7 @@ Confirmed aliases include VOE's `ellenpoliticalfollow.com`, Vidoza's `videzz.net
 ### Diagnose a URL
 
 ```sh
-curl -X POST https://resolve.nated.at/resolve/diagnose \
+curl -X POST https://resolve.btc-mining.at/resolve/diagnose \
   -H 'content-type: application/json' \
   --data '{
     "url": "https://voe.sx/e/example",
@@ -76,21 +78,25 @@ curl -X POST https://resolve.nated.at/resolve/diagnose \
 
 `checkPlayback` defaults to `false`. When enabled, the Worker first sends HEAD and falls back to a bounded Range GET when HEAD is rejected or uninformative. Results distinguish `classified`, `playback_url_created`, `endpoint_reachable`, `manifest_loaded`, and `playable`.
 
-The response includes classification confidence, matched rule, redirect chain, resolved source, MediaFlow endpoint, playback URL, HTTP metadata, duration, CORS indication, warnings, and a stable sanitized error.
+The response includes classification confidence, `resolutionTransport` (`none`, `worker_direct`, or `mediaflow_forward`), redirect chain, resolved source, MediaFlow endpoint, playback URL, HTTP metadata, warnings, and a stable sanitized error.
 
 ### List providers
 
 ```sh
-curl https://resolve.nated.at/resolve/providers
+curl https://resolve.btc-mining.at/resolve/providers
 ```
 
 The response exposes only provider IDs, canonical MediaFlow names, preferred endpoints, and redirect support. The complete OpenAPI 3.1.1 contract and examples are in [`openapi.yaml`](openapi.yaml).
 
 ## Redirects, AniWorld, and ARD
 
-Redirect resolution uses manual redirects, a five-hop limit, per-request and total timeouts, and validation before each fetch. AniWorld is a redirect source, never a MediaFlow provider; its final target determines the extractor.
+AniWorld episode pages are loaded through internal MediaFlow Forward and searched for registered provider URLs. One target continues through the normal extractor flow; multiple targets return `partially_resolved`. AniWorld `/redirect/` stays on manual Worker redirects because Forward does not expose its final redirect URL.
 
-ARD series and season pages return `ARD_NOT_PLAYABLE_ITEM`. The resolver never selects an arbitrary episode. Concrete items are inspected for structured player data and HLS, DASH, or direct media URLs before normal endpoint selection.
+ARD pages are loaded through Forward and inspected for structured player data and HLS, DASH, or direct media URLs. Series and season pages return `ARD_NOT_PLAYABLE_ITEM`; the resolver never selects an arbitrary episode.
+
+Forward is an internal page-fetch transport, not a playback route. It accepts only resolver-controlled GET requests and selected headers. It is never present in the public gateway allowlist. HLS, DASH, files, and extractor playback continue through streaming-aware MediaFlow routes with Range and manifest rewriting support.
+
+MediaFlow-signed playback subpaths are relayed only when they match the strict token-path shape. Their origin is rewritten to the Worker, and client query parameters are discarded. This keeps the MediaFlow hostname and password out of public manifests while preserving nested HLS/DASH playback.
 
 If an unknown page exposes more than one supported target, the result is `partially_resolved` and no arbitrary target is selected.
 
@@ -100,6 +106,7 @@ If an unknown page exposes more than one supported target, the result is `partia
 - Loopback, private, link-local, carrier-grade NAT, benchmarking, multicast, and reserved IPv4/IPv6 ranges are blocked.
 - A and AAAA answers are checked through DNS-over-HTTPS before every server-side page fetch.
 - Every redirect target is validated again.
+- Forward targets must match a provider-registry host, AniWorld, or ARD at a domain boundary.
 - HTML is limited to 512 KiB, playback samples to 64 KiB, individual fetches to 8 seconds, and resolution to 20 seconds.
 - Large media responses continue to stream; only bounded HTML, manifests, and diagnostic samples are buffered.
 - No stack traces, tokens, API keys, cookies, or sensitive request headers are returned.
@@ -126,4 +133,4 @@ npm run lint
 npx wrangler deploy --dry-run
 ```
 
-Tests use compact tables for all providers and focused mocks for redirects, ARD, playback probing, DNS, private targets, timeouts, encoding, and domain-boundary attacks. Provider classification and URL construction do not claim that a current third-party stream is live or playable.
+Tests use compact tables for all providers and focused mocks for Forward, redirects, ARD, playback probing, DNS, private targets, timeouts, encoding, and domain-boundary attacks. Provider classification and URL construction do not claim that a current third-party stream is live or playable.
