@@ -1,6 +1,6 @@
 # cf-stream-resolve
 
-A Cloudflare Worker that creates safe, Worker-local MediaFlow proxy URLs. Local host adapters, HTML scraping, browser impersonation, and access-control bypasses are intentionally not included.
+A Cloudflare Worker that classifies public video URLs and creates the correct, Worker-local MediaFlow playback URL. Local host adapters, HTML scraping, browser impersonation, and access-control bypasses are intentionally not included.
 
 ## Configuration
 
@@ -22,19 +22,29 @@ Set the password outside the repository:
 npx wrangler secret put MEDIAFLOW_API_PASSWORD
 ```
 
-`MEDIAFLOW_API_PASSWORD` is appended only to the selected MediaFlow upstream request and is never included in a Worker-generated URL or relayed redirect.
+`MEDIAFLOW_API_PASSWORD` is appended only to the selected MediaFlow upstream request and is removed from Worker-generated URLs, relayed redirects, and rewritten manifests.
 
 ## API
 
-`GET /proxy/stream?d=<encoded URL>` validates `d`, selects a configured MediaFlow server, and streams its response without buffering. It transparently returns its status, body, content type, and redirects. Optional flags are forwarded only when set to `true`:
+The resolver chooses a playback route from the URL before any media is fetched:
+
+- YouTube URLs remain direct.
+- `.m3u8` and `.m3u` use `/proxy/hls/manifest.m3u8`.
+- `.mpd` uses `/proxy/mpd/manifest.m3u8`.
+- Supported extractor providers use `/extractor/video`.
+- Other public HTTP(S) URLs use `/proxy/stream`.
+
+Gateway routes validate `d`, select the configured MediaFlow server, and support cross-origin `GET`, `HEAD`, and byte-range requests. Binary streams pass through without buffering. HLS manifests are size-bounded and rewritten so nested playlists, segments, keys, and init maps stay on the Worker origin.
+
+If MediaFlow returns the exact Cloudflare response `403 error code: 1003` for an otherwise valid public destination, the Worker first retries MediaFlow with its documented `no_proxy=true` mode and then retries the validated destination directly. This fallback chain is deliberately limited to that signature; all other MediaFlow errors pass through unchanged.
 
 ```sh
-curl -i 'https://YOUR-WORKER.workers.dev/proxy/stream?d=https%3A%2F%2Fvideo.example%2Fembed%2Fabc&max_res=true&redirect_stream=true'
+curl -i 'https://YOUR-WORKER.workers.dev/proxy/hls/manifest.m3u8?d=https%3A%2F%2Fcdn.example%2Flive%2Findex.m3u8'
 ```
 
-Use `proxyServer=<encoded allowlisted base URL>` to choose a non-default configured server. Arbitrary proxy server URLs are rejected.
+The server is selected exclusively from `MEDIAFLOW_PROXY_SERVERS`; clients cannot choose or override a proxy host. `MEDIAFLOW_PROXY_DEFAULT` selects an allowlisted entry, and the first configured server is used if no default is set.
 
-`/` and `/interaction/resolve.html` remain available. Their existing `url` parameter is converted into a Worker-local `/proxy/stream?d=…` URL, preserving the prior JSON and MSX response contracts. They also accept `proxyServer`, `redirect_stream`, `transcode`, and `max_res`.
+`/` and `/interaction/resolve.html` remain available and preserve their existing JSON and MSX response envelopes. Their `url` input is classified using the same resolver as MCP. Compatibility options `redirect_stream`, `transcode`, and `max_res` remain accepted; options unsupported by the configured MediaFlow API are omitted and reported in `warnings`.
 
 ## MCP
 
@@ -62,15 +72,18 @@ curl -X POST https://YOUR-WORKER.workers.dev/mcp \
 curl -X POST https://YOUR-WORKER.workers.dev/mcp \
   -H 'content-type: application/json' \
   -H 'accept: application/json, text/event-stream' \
-  --data '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"resolve_video","arguments":{"url":"https://video.example/embed/abc","max_res":true}}}'
+  --data '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"resolve_video","arguments":{"url":"https://cdn.example/live/index.m3u8","link":"https://video.example/embed/abc","provider":"Vidmoly"}}}'
 ```
 
-The tool only creates a Worker-local proxy URL. It does not fetch media during the call, bypass access controls, or expose MediaFlow credentials.
+The tool only creates a direct YouTube URL or Worker-local playback URL. It does not fetch media during the call, bypass access controls, or expose MediaFlow credentials. Successful results retain `url`, `source`, `original`, and `alternates`, and may add `mediaType` and `warnings`.
+
+For compatibility with clients that attach playback context, `resolve_video` accepts optional `link`, `endpoint` (only `/proxy/stream`), and `provider` fields. `endpoint` never overrides automatic routing. A validated `link` supplies upstream Referer and Origin context but never replaces `url`. Direct media URLs take precedence over provider extraction. The configured MediaFlow API currently supports `Doodstream`, `Mixdrop`, `Uqload`, `Streamtape`, `Supervideo`, and `LiveTV`; other embed-only providers return `unsupported_provider`.
 
 ## Development
 
 ```sh
 npm install
+npx wrangler types
 npm run dev
 npm test
 npm run lint

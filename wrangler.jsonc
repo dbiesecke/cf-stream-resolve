@@ -2,7 +2,18 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "cf-stream-resolve",
   "main": "src/index.ts",
-  "compatibility_date": "2026-07-17",
+  "compatibility_date": "2026-07-18",
   "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "MEDIAFLOW_PROXY_SERVERS": "http://5.161.220.50:8888",
+    "MEDIAFLOW_PROXY_DEFAULT": "http://5.161.220.50:8888"
+  },
+  "routes": [
+    {
+      "pattern": "resolve.nated.at",
+      "zone_name": "nated.at",
+      "custom_domain": true
+    }
+  ],
   "observability": { "enabled": true, "head_sampling_rate": 1 }
 }
