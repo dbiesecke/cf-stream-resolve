@@ -1,0 +1,5 @@
+This project includes TypeScript ports and host metadata patterns derived from
+mediaflow-proxy-light (https://github.com/mhdzumair/mediaflow-proxy-light),
+Copyright (c) 2025 Mohamed Zumair, licensed under the MIT License.
+
+The original MIT license terms apply to those derived portions.

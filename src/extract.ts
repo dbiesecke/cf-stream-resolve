@@ -5,6 +5,23 @@ import { extractArdMetadata } from "./providers";
 const media = (url: string) => /\.(mp4|m3u8)(?:[?#]|$)/i.test(url);
 function attribute(tag: string, name: string): string | undefined { return new RegExp(`\\b${name}\\s*=\\s*["']([^"']+)["']`, "i").exec(tag)?.[1]; }
 function meta(html: string, keys: string[]): string | undefined { for (const key of keys) { const hit = new RegExp(`<meta\\b[^>]*(?:property|name)=["']${key}["'][^>]*>`, "i").exec(html); const value = hit && attribute(hit[0], "content"); if (value) return value; } return undefined; }
+function jsonObjectAt(html: string, start: number): unknown | undefined {
+  const opening = html.indexOf("{", start); if (opening < 0) return undefined;
+  let depth = 0; let quoted = false; let escaped = false;
+  for (let index = opening; index < html.length; index += 1) {
+    const char = html[index];
+    if (quoted) { if (escaped) escaped = false; else if (char === "\\") escaped = true; else if (char === '"') quoted = false; continue; }
+    if (char === '"') { quoted = true; continue; }
+    if (char === "{") depth += 1;
+    if (char === "}" && --depth === 0) { try { return JSON.parse(html.slice(opening, index + 1)); } catch { return undefined; } }
+  }
+  return undefined;
+}
+function playerMetadata(html: string): unknown[] {
+  const values: unknown[] = []; const pattern = /\b(?:var|let|const)\s+(?:flashvars|playerConfig|playerData)[\w$]*\s*=/gi; let examined = 0;
+  for (const match of html.matchAll(pattern)) { if (examined++ === 4) break; const value = jsonObjectAt(html, match.index! + match[0].length); if (value) values.push(value); }
+  return values;
+}
 export function collectMediaUrls(value: unknown, page: URL, depth = 0, seen = new WeakSet<object>()): string[] {
   if (depth > 8 || !value || typeof value !== "object") return [];
   if (seen.has(value)) return []; seen.add(value);
@@ -20,6 +37,7 @@ export function extractMedia(html: string, page: URL): ResolvedVideo | undefined
   for (const tag of html.matchAll(/<(?:video|source)\b[^>]*>/gi)) { const asset = safeAsset(attribute(tag[0], "src"), page); if (asset && media(asset)) candidates.push(asset); }
   for (const key of ["og:video", "og:video:url", "twitter:player:stream"]) { const asset = safeAsset(meta(html, [key]), page); if (asset && media(asset)) candidates.push(asset); }
   for (const tag of html.matchAll(/<script\b[^>]*type=["']application\/(?:ld\+)?json["'][^>]*>([\s\S]*?)<\/script>/gi)) { try { candidates.push(...collectMediaUrls(JSON.parse(tag[1]), page)); } catch { /* invalid publisher JSON is ignored */ } }
+  for (const config of playerMetadata(html)) candidates.push(...collectMediaUrls(config, page));
   const unique = [...new Set(candidates)]; if (!unique.length) return undefined;
   const primary = unique.find((value) => /\.m3u8(?:[?#]|$)/i.test(value)) ?? unique[0];
   const faviconTag = /<link\b[^>]*rel=["'][^"']*icon[^"']*["'][^>]*>/i.exec(html)?.[0];
